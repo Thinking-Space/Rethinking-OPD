@@ -35,13 +35,15 @@ class TestMetrics(unittest.TestCase):
                         [-0.3507, -0.5426, -0.2725, -0.4637, -0.3577, -0.3733, -1.7560, -1.9542, -0.4229, -1.3098],
                     ]
                 ),
-                "loss_mask": torch.tensor([[1, 0, 0, 0, 1, 1, 0, 1, 1, 0], [1, 0, 1, 0, 1, 1, 1, 0, 1, 1]]),
+                "response_mask": torch.ones((2, 10), dtype=torch.long),
                 "responses": torch.zeros((2, 10)),
             }
         )
         metrics = calculate_debug_metrics(data)
         print(metrics)
         assert metrics["training/rollout_probs_diff_valid"] == 1
+        self.assertAlmostEqual(metrics["training/rollout_log_probs_diff_max"], 1.8831, places=4)
+        self.assertAlmostEqual(metrics["training/rollout_log_probs_diff_mean"], 0.70112, places=5)
 
 
 if __name__ == "__main__":

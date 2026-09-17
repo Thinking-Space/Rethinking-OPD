@@ -29,7 +29,8 @@ save_steps: 200
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: True
-report_to: swanlab # choices: [none, wandb, tensorboard, swanlab, mlflow]
+report_to: wandb # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: Qwen3-1.7B-Base-SFT-OpenThought3-4B
 
 ### train
 per_device_train_batch_size: 8
@@ -49,8 +50,3 @@ val_size: 0.05
 per_device_eval_batch_size: 4
 eval_strategy: steps
 eval_steps: 100
-
-### swanlab
-use_swanlab: true
-swanlab_project: llamafactory
-swanlab_run_name: Qwen3-1.7B-Base-SFT-OpenThought3-4B

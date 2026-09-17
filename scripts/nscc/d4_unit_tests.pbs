@@ -1,0 +1,61 @@
+#!/bin/bash
+#PBS -N opd_d4_tests
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=00:20:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+
+source "$OPD_SETUP/activate_opd.sh"
+module load git/2.39.2
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+python -m pytest -q \
+    tests/nscc/test_d4_pipeline.py \
+    tests/nscc/test_d4_acceptance.py \
+    verl/tests/utils/test_opd_teacher_guard.py \
+    verl/tests/utils/test_opd_rollout_json.py
+
+python -m py_compile \
+    scripts/nscc/d4_analyze_smoke.py \
+    scripts/nscc/d7_9_analyze_formal.py \
+    scripts/nscc/d15_sampled_token_config.py
+bash -n \
+    scripts/nscc/d7_9_formal_run.pbs \
+    scripts/nscc/d15_sampled_token_run.pbs
+
+PREFLIGHT_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/opd-d15-preflight.XXXXXX")
+trap 'rm -rf "$PREFLIGHT_ROOT"' EXIT
+mapfile -t sampled_token_overrides < <(
+    python scripts/nscc/d15_sampled_token_config.py \
+        --project-root "$PROJECT_ROOT" \
+        --run-root "$PREFLIGHT_ROOT/run" \
+        --phase primary \
+        --format lines
+)
+python -m verl.trainer.main_ppo "${sampled_token_overrides[@]}" \
+    --cfg job --resolve > "$PREFLIGHT_ROOT/resolved.yaml"
+python scripts/nscc/d15_sampled_token_config.py \
+    --run-root "$PREFLIGHT_ROOT/run" \
+    --phase primary \
+    --verify-resolved "$PREFLIGHT_ROOT/resolved.yaml"
+
+git diff --check -- \
+    scripts/nscc/d4_analyze_smoke.py \
+    scripts/nscc/d7_9_analyze_formal.py \
+    scripts/nscc/d7_9_formal_run.pbs \
+    scripts/nscc/d15_sampled_token_config.py \
+    scripts/nscc/d15_sampled_token_run.pbs \
+    tests/nscc/test_d4_pipeline.py \
+    tests/nscc/test_d4_acceptance.py
+echo "SAMPLED_TOKEN_STATIC_PREFLIGHT_OK"

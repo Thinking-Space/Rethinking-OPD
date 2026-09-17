@@ -1,0 +1,180 @@
+#!/bin/bash
+#PBS -N opd_d12_final_eval
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=8:mem=120gb:ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+MAIN_RUN_ROOT="$PROJECT_ROOT/logs/main/21110343_pbs101"
+CHECKPOINT="$MAIN_RUN_ROOT/checkpoints/global_step_528"
+FINAL_EXPORT="$MAIN_RUN_ROOT/exported/global_step_528"
+BASELINE_JOB_ROOT="$PROJECT_ROOT/eval/baseline/20395781_pbs101"
+BASELINE_ROOT="$BASELINE_JOB_ROOT/artifacts"
+TRAINING_ACCEPTANCE="$MAIN_RUN_ROOT/reports/main_acceptance.json"
+RUN_ID=${PBS_JOBID//./_}
+EVAL_ROOT="$PROJECT_ROOT/eval/final/$RUN_ID"
+MERGE_STAGE="$MAIN_RUN_ROOT/exported/.global_step_528_$RUN_ID"
+PROJECT_REPORT="$PROJECT_ROOT/reports/NSCC_OPD_FINAL_REPORT.md"
+PROJECT_RESULT="$PROJECT_ROOT/reports/NSCC_OPD_FINAL_EVALUATION.json"
+
+if [[ -e "$EVAL_ROOT" ]]; then
+    echo "Refusing to overwrite final-evaluation root: $EVAL_ROOT" >&2
+    exit 2
+fi
+if [[ -e "$PROJECT_REPORT" || -e "$PROJECT_RESULT" ]]; then
+    echo "Refusing to overwrite published final report" >&2
+    exit 2
+fi
+mkdir -p "$EVAL_ROOT" "$PROJECT_ROOT/reports" "$MAIN_RUN_ROOT/exported"
+exec > >(tee "$EVAL_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    if [[ $status -ne 0 ]]; then
+        echo "FAILED_EVAL_ROOT=$EVAL_ROOT"
+        if [[ -e "$MERGE_STAGE" ]]; then
+            echo "FAILED_MERGE_STAGE=$MERGE_STAGE"
+        fi
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=disabled
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=4
+export RAY_TMPDIR="/tmp/opd_d12_$RUN_ID"
+mkdir -p "$RAY_TMPDIR"
+
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 1 ]]; then
+    echo "Expected exactly one PBS-assigned GPU, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "FINAL_CHECKPOINT=$CHECKPOINT"
+echo "EVAL_ROOT=$EVAL_ROOT"
+echo "EVAL_BUDGET_UPPER_BOUND_GPU_HOURS=3"
+echo "EVAL_BUDGET_UPPER_BOUND_SU=192"
+module list 2>&1
+nvidia-smi
+python -m pip check
+
+test -s "$CHECKPOINT/data.pt"
+test -d "$CHECKPOINT/actor"
+test -s "$TRAINING_ACCEPTANCE"
+test -s "$BASELINE_ROOT/summary.json"
+test -s "$BASELINE_ROOT/acceptance.json"
+test -s "$BASELINE_JOB_ROOT/artifact_sha256.txt"
+jq -e '.passed == true and .d7_9_status == "PASS_TRAINING_COMPLETE" and .full_data_one_epoch == true' \
+    "$TRAINING_ACCEPTANCE" >/dev/null
+(
+    cd "$BASELINE_JOB_ROOT"
+    sha256sum --check artifact_sha256.txt
+)
+
+python scripts/nscc/d12_final_eval.py \
+    --model "$FINAL_EXPORT" \
+    --gpu-id 0 \
+    --print-plan | tee "$EVAL_ROOT/frozen_plan.json"
+
+(
+    while true; do
+        date --iso-8601=seconds
+        nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu \
+            --format=csv,noheader
+        sleep 60
+    done
+) > "$EVAL_ROOT/gpu_monitor.log" 2>&1 &
+MONITOR_PID=$!
+
+if [[ -e "$FINAL_EXPORT" ]]; then
+    test -s "$FINAL_EXPORT/config.json"
+    if ! find "$FINAL_EXPORT" -maxdepth 1 -type f -name '*.safetensors' -size +0c | grep -q .; then
+        echo "Existing final export has no non-empty safetensors file: $FINAL_EXPORT" >&2
+        exit 2
+    fi
+    echo "REUSING_FINAL_EXPORT=$FINAL_EXPORT"
+else
+    if [[ -e "$MERGE_STAGE" ]]; then
+        echo "Refusing to overwrite merge staging directory: $MERGE_STAGE" >&2
+        exit 2
+    fi
+    python verl/scripts/legacy_model_merger.py merge \
+        --backend fsdp \
+        --local_dir "$CHECKPOINT/actor" \
+        --target_dir "$MERGE_STAGE"
+    test -s "$MERGE_STAGE/config.json"
+    if ! find "$MERGE_STAGE" -maxdepth 1 -type f -name '*.safetensors' -size +0c | grep -q .; then
+        echo "Merged model has no non-empty safetensors file" >&2
+        exit 2
+    fi
+    mv "$MERGE_STAGE" "$FINAL_EXPORT"
+    echo "PUBLISHED_FINAL_EXPORT=$FINAL_EXPORT"
+fi
+
+python scripts/nscc/d12_final_eval.py \
+    --model "$FINAL_EXPORT" \
+    --gpu-id 0 \
+    --output-dir "$EVAL_ROOT/artifacts"
+
+mkdir -p "$EVAL_ROOT/reports"
+python scripts/nscc/d12_analyze_final.py \
+    --baseline-dir "$BASELINE_ROOT" \
+    --final-dir "$EVAL_ROOT/artifacts" \
+    --training-acceptance "$TRAINING_ACCEPTANCE" \
+    --output-json "$EVAL_ROOT/reports/final_evaluation.json" \
+    --report-md "$EVAL_ROOT/reports/final_report.md" \
+    --failure-cases "$EVAL_ROOT/reports/failure_cases.json" \
+    --bootstrap-replicates 10000 \
+    --seed 2026
+
+jq -e '.passed == true and .evaluation_status == "TECHNICALLY_COMPLETE"' \
+    "$EVAL_ROOT/reports/final_evaluation.json" >/dev/null
+cp "$EVAL_ROOT/reports/final_report.md" "$PROJECT_REPORT"
+cp "$EVAL_ROOT/reports/final_evaluation.json" "$PROJECT_RESULT"
+
+sha256sum \
+    "$EVAL_ROOT/frozen_plan.json" \
+    "$EVAL_ROOT/artifacts/final/dev_256.jsonl" \
+    "$EVAL_ROOT/artifacts/final/MATH-500.jsonl" \
+    "$EVAL_ROOT/artifacts/final/AIME24.jsonl" \
+    "$EVAL_ROOT/artifacts/summary.json" \
+    "$EVAL_ROOT/artifacts/acceptance.json" \
+    "$EVAL_ROOT/reports/final_evaluation.json" \
+    "$EVAL_ROOT/reports/final_report.md" \
+    "$EVAL_ROOT/reports/failure_cases.json" \
+    "$PROJECT_REPORT" \
+    "$PROJECT_RESULT" \
+    > "$EVAL_ROOT/artifact_sha256.txt"
+sha256sum --check "$EVAL_ROOT/artifact_sha256.txt"
+
+echo "FINAL_VERDICT=$(jq -r '.conclusion.verdict' "$EVAL_ROOT/reports/final_evaluation.json")"
+echo "STOP_LOSS_TRIGGERED=$(jq -r '.conclusion.stop_loss_triggered' "$EVAL_ROOT/reports/final_evaluation.json")"
+echo "D12_INDEPENDENT_EVALUATION_COMPLETE"

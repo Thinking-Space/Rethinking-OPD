@@ -1,0 +1,98 @@
+#!/bin/bash
+#PBS -N opd_d12_closeout
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+EVAL_ROOT="$PROJECT_ROOT/eval/final/21857038_pbs101"
+OLD_MANIFEST="$EVAL_ROOT/artifact_sha256.txt"
+JOB_MANIFEST="$EVAL_ROOT/artifact_sha256.job.txt"
+FINAL_MANIFEST="$EVAL_ROOT/artifact_sha256.txt"
+REPORT="$PROJECT_ROOT/reports/NSCC_OPD_FINAL_REPORT.md"
+RESULT="$PROJECT_ROOT/reports/NSCC_OPD_FINAL_EVALUATION.json"
+LEDGER="$PROJECT_ROOT/reports/compute_ledger.json"
+TIMELINE="$PROJECT_ROOT/NSCC_OPD_Reproduction_Timeline.md"
+FINAL_EXPORT="$PROJECT_ROOT/logs/main/21110343_pbs101/exported/global_step_528"
+TEMP_DIR=$(mktemp -d "/tmp/opd_d12_closeout_${PBS_JOBID//./_}.XXXXXX")
+
+on_exit() {
+    status=$?
+    if [[ -f "$TEMP_DIR/job_core_manifest.txt" ]]; then
+        rm -f "$TEMP_DIR/job_core_manifest.txt"
+    fi
+    rmdir "$TEMP_DIR" 2>/dev/null || true
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    exit "$status"
+}
+trap on_exit EXIT
+
+source /home/users/nus/xiongjie/scratch/opd-setup/activate_opd.sh
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+
+test -s "$OLD_MANIFEST"
+if [[ -e "$JOB_MANIFEST" ]]; then
+    echo "Refusing to overwrite preserved job-time manifest: $JOB_MANIFEST" >&2
+    exit 2
+fi
+test -s "$REPORT"
+test -s "$RESULT"
+test -s "$LEDGER"
+test -s "$TIMELINE"
+test -s "$FINAL_EXPORT/model.safetensors"
+
+# The report gained a resource/reproducibility appendix after the GPU job. Verify
+# every unchanged job-time artifact before preserving that original manifest.
+awk -v report="$REPORT" '$2 != report' "$OLD_MANIFEST" > "$TEMP_DIR/job_core_manifest.txt"
+sha256sum --check "$TEMP_DIR/job_core_manifest.txt"
+mv "$OLD_MANIFEST" "$JOB_MANIFEST"
+
+jq -e '.passed == true and .evaluation_status == "TECHNICALLY_COMPLETE" and .conclusion.verdict == "REPRODUCED_RELIABLE_GAIN" and .conclusion.stop_loss_triggered == false' "$RESULT" >/dev/null
+jq -e '.accepted_path_totals.gpu_hours == 66.9919444444 and .accepted_path_totals.estimated_su == 4287.4844444416' "$LEDGER" >/dev/null
+grep -Fq '最终门禁：G3 PASS（服务器内可复跑）' "$TIMELINE"
+grep -Fq '## Resource ledger' "$REPORT"
+
+python -m pytest -q \
+    tests/nscc/test_d4_pipeline.py \
+    tests/nscc/test_d4_acceptance.py \
+    verl/tests/utils/test_opd_teacher_guard.py \
+    verl/tests/utils/test_opd_rollout_json.py
+
+sha256sum \
+    scripts/nscc/d4_pipeline.py \
+    scripts/nscc/d12_final_eval.py \
+    scripts/nscc/d12_analyze_final.py \
+    scripts/nscc/d12_final_eval.pbs \
+    scripts/nscc/d12_closeout.pbs \
+    tests/nscc/test_d4_pipeline.py \
+    "$TIMELINE" \
+    "$REPORT" \
+    "$RESULT" \
+    "$LEDGER" \
+    "$EVAL_ROOT/frozen_plan.json" \
+    "$EVAL_ROOT/artifacts/final/dev_256.jsonl" \
+    "$EVAL_ROOT/artifacts/final/MATH-500.jsonl" \
+    "$EVAL_ROOT/artifacts/final/AIME24.jsonl" \
+    "$EVAL_ROOT/artifacts/summary.json" \
+    "$EVAL_ROOT/artifacts/acceptance.json" \
+    "$EVAL_ROOT/reports/final_evaluation.json" \
+    "$EVAL_ROOT/reports/final_report.md" \
+    "$EVAL_ROOT/reports/failure_cases.json" \
+    "$FINAL_EXPORT/config.json" \
+    "$FINAL_EXPORT/model.safetensors" \
+    > "$FINAL_MANIFEST"
+sha256sum --check "$FINAL_MANIFEST"
+
+echo "FINAL_MANIFEST=$FINAL_MANIFEST"
+echo "D12_FINAL_CLOSEOUT_OK"

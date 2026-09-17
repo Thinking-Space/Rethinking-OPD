@@ -1,0 +1,162 @@
+#!/bin/bash
+#PBS -N opd_d4_closeout
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=8:mem=96gb:ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+BASELINE_ROOT="$PROJECT_ROOT/eval/baseline/20395781_pbs101/artifacts"
+: "${OPD_SMOKE_RUN_ID:?submit with qsub -v OPD_SMOKE_RUN_ID=<job_id_with_underscores>}"
+if [[ ! "$OPD_SMOKE_RUN_ID" =~ ^[0-9]+_pbs[0-9]+$ ]]; then
+    echo "Invalid OPD_SMOKE_RUN_ID: $OPD_SMOKE_RUN_ID" >&2
+    exit 2
+fi
+
+RUN_ROOT="$PROJECT_ROOT/logs/smoke/$OPD_SMOKE_RUN_ID"
+POSTPROCESS_ID=${PBS_JOBID//./_}
+TEMP_ROOT="$RUN_ROOT/.postprocess_$POSTPROCESS_ID"
+POSTPROCESS_LOG="$RUN_ROOT/postprocess_$POSTPROCESS_ID.log"
+
+mkdir -p "$RUN_ROOT"
+exec > >(tee "$POSTPROCESS_LOG") 2>&1
+
+on_exit() {
+    status=$?
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    if [[ $status -ne 0 && -d "$TEMP_ROOT" ]]; then
+        echo "FAILED_STAGING_ROOT=$TEMP_ROOT"
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+export RAY_TMPDIR="/tmp/opd_d4_closeout_$POSTPROCESS_ID"
+export OMP_NUM_THREADS=4
+mkdir -p "$RAY_TMPDIR"
+
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 1 ]]; then
+    echo "Expected exactly one PBS-assigned GPU, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0
+
+echo "JOB_ID=$PBS_JOBID"
+echo "SOURCE_RUN=$RUN_ROOT"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+
+test -s "$RUN_ROOT/logs/primary.log"
+test -s "$RUN_ROOT/logs/resume.log"
+test -s "$RUN_ROOT/configs/resolved_smoke_primary.yaml"
+test -s "$RUN_ROOT/configs/resolved_smoke_resume.yaml"
+test -s "$RUN_ROOT/checkpoints/global_step_5/data.pt"
+test -s "$RUN_ROOT/checkpoints/global_step_8/data.pt"
+test -s "$PROJECT_ROOT/repro/requirements.lock.txt"
+test -s "$PROJECT_ROOT/repro/manifest.json"
+test -s "$BASELINE_ROOT/summary.json"
+test -s "$PROJECT_ROOT/datasets/nscc_d4/dev_256_seed2026.parquet"
+
+published_paths=(
+    "$RUN_ROOT/reports/log_acceptance.json"
+    "$RUN_ROOT/exported/global_step_8"
+    "$RUN_ROOT/export_inference"
+    "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json"
+    "$RUN_ROOT/reports/readiness.md"
+    "$RUN_ROOT/artifact_sha256.txt"
+    "$PROJECT_ROOT/requirements.lock.txt"
+    "$PROJECT_ROOT/configs/resolved_smoke.yaml"
+    "$PROJECT_ROOT/reports/readiness.md"
+)
+for path in "${published_paths[@]}"; do
+    if [[ -e "$path" ]]; then
+        echo "Refusing to overwrite D4 published artifact: $path" >&2
+        exit 2
+    fi
+done
+if [[ -e "$TEMP_ROOT" ]]; then
+    echo "Refusing to overwrite staging directory: $TEMP_ROOT" >&2
+    exit 2
+fi
+mkdir -p "$TEMP_ROOT/reports" "$TEMP_ROOT/exported"
+
+python scripts/nscc/d4_analyze_smoke.py \
+    --primary-log "$RUN_ROOT/logs/primary.log" \
+    --resume-log "$RUN_ROOT/logs/resume.log" \
+    --output "$TEMP_ROOT/reports/log_acceptance.json"
+
+python verl/scripts/legacy_model_merger.py merge \
+    --backend fsdp \
+    --local_dir "$RUN_ROOT/checkpoints/global_step_8/actor" \
+    --target_dir "$TEMP_ROOT/exported/global_step_8"
+
+CUDA_VISIBLE_DEVICES=0 python scripts/nscc/d4_export_inference.py \
+    --model "$TEMP_ROOT/exported/global_step_8" \
+    --dev-file "$PROJECT_ROOT/datasets/nscc_d4/dev_256_seed2026.parquet" \
+    --output-dir "$TEMP_ROOT/export_inference"
+
+python scripts/nscc/d4_checkpoint_verify.py \
+    --checkpoint "$RUN_ROOT/checkpoints/global_step_5" \
+    --checkpoint "$RUN_ROOT/checkpoints/global_step_8" \
+    --initial-model "$PROJECT_ROOT/model/DeepSeek-R1-Distill-Qwen-1.5B" \
+    --exported-model "$TEMP_ROOT/exported/global_step_8" \
+    --output "$TEMP_ROOT/reports/checkpoint_and_weight_acceptance.json"
+
+python scripts/nscc/d4_publish_readiness.py \
+    --data-manifest "$PROJECT_ROOT/repro/manifest.json" \
+    --baseline-summary "$BASELINE_ROOT/summary.json" \
+    --log-report "$TEMP_ROOT/reports/log_acceptance.json" \
+    --checkpoint-report "$TEMP_ROOT/reports/checkpoint_and_weight_acceptance.json" \
+    --export-acceptance "$TEMP_ROOT/export_inference/acceptance.json" \
+    --smoke-root "$RUN_ROOT" \
+    --output "$TEMP_ROOT/reports/readiness.md"
+
+cp "$PROJECT_ROOT/repro/requirements.lock.txt" "$TEMP_ROOT/requirements.lock.txt"
+cp "$RUN_ROOT/configs/resolved_smoke_primary.yaml" "$TEMP_ROOT/resolved_smoke.yaml"
+cp "$TEMP_ROOT/reports/readiness.md" "$TEMP_ROOT/readiness.md"
+
+mkdir -p "$RUN_ROOT/reports" "$RUN_ROOT/exported" "$PROJECT_ROOT/configs" "$PROJECT_ROOT/reports"
+mv "$TEMP_ROOT/reports/log_acceptance.json" "$RUN_ROOT/reports/log_acceptance.json"
+mv "$TEMP_ROOT/reports/checkpoint_and_weight_acceptance.json" "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json"
+mv "$TEMP_ROOT/reports/readiness.md" "$RUN_ROOT/reports/readiness.md"
+mv "$TEMP_ROOT/exported/global_step_8" "$RUN_ROOT/exported/global_step_8"
+mv "$TEMP_ROOT/export_inference" "$RUN_ROOT/export_inference"
+mv "$TEMP_ROOT/requirements.lock.txt" "$PROJECT_ROOT/requirements.lock.txt"
+mv "$TEMP_ROOT/resolved_smoke.yaml" "$PROJECT_ROOT/configs/resolved_smoke.yaml"
+mv "$TEMP_ROOT/readiness.md" "$PROJECT_ROOT/reports/readiness.md"
+rmdir "$TEMP_ROOT/reports" "$TEMP_ROOT/exported" "$TEMP_ROOT"
+
+sha256sum \
+    "$RUN_ROOT/configs/resolved_smoke_primary.yaml" \
+    "$RUN_ROOT/configs/resolved_smoke_resume.yaml" \
+    "$RUN_ROOT/reports/log_acceptance.json" \
+    "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json" \
+    "$RUN_ROOT/export_inference/acceptance.json" \
+    "$RUN_ROOT/reports/readiness.md" \
+    "$PROJECT_ROOT/requirements.lock.txt" \
+    "$PROJECT_ROOT/configs/resolved_smoke.yaml" \
+    "$PROJECT_ROOT/reports/readiness.md" \
+    > "$RUN_ROOT/artifact_sha256.txt"
+sha256sum --check "$RUN_ROOT/artifact_sha256.txt"
+echo "D4_G1_CLOSEOUT_OK"

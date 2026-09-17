@@ -1,0 +1,69 @@
+#!/bin/bash
+#PBS -N opd_d4_baseline
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=16:mem=120gb:ngpus=2
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+RUN_ID=${PBS_JOBID//./_}
+OUTPUT_DIR="$PROJECT_ROOT/eval/baseline/$RUN_ID"
+mkdir -p "$OUTPUT_DIR"
+exec > >(tee "$OUTPUT_DIR/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=disabled
+export OMP_NUM_THREADS=4
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 2 ]]; then
+    echo "Expected exactly two PBS-assigned GPUs, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0,1
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+
+(
+    while true; do
+        date --iso-8601=seconds
+        nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader
+        sleep 60
+    done
+) > "$OUTPUT_DIR/gpu_monitor.log" 2>&1 &
+MONITOR_PID=$!
+
+python scripts/nscc/d4_baseline_eval.py --student-model "$PROJECT_ROOT/model/DeepSeek-R1-Distill-Qwen-1.5B" --teacher-model "$PROJECT_ROOT/model/JustRL-DeepSeek-1.5B" --gpu-ids "$CUDA_VISIBLE_DEVICES" --output-dir "$OUTPUT_DIR/artifacts"
+
+sha256sum "$OUTPUT_DIR/artifacts/student/dev_256.jsonl" "$OUTPUT_DIR/artifacts/student/MATH-500.jsonl" "$OUTPUT_DIR/artifacts/student/AIME24.jsonl" "$OUTPUT_DIR/artifacts/teacher/dev_256.jsonl" "$OUTPUT_DIR/artifacts/teacher/MATH-500.jsonl" "$OUTPUT_DIR/artifacts/teacher/AIME24.jsonl" "$OUTPUT_DIR/artifacts/summary.json" "$OUTPUT_DIR/artifacts/acceptance.json" > "$OUTPUT_DIR/artifact_sha256.txt"
+sha256sum --check "$OUTPUT_DIR/artifact_sha256.txt"
+echo "D4_BASELINE_OK"

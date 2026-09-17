@@ -58,7 +58,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.tracking import ValidationGenerationsLogger, create_wandb_image
 
 
 @dataclass
@@ -438,6 +438,8 @@ class RayPPOTrainer:
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
+        from verl.utils.opd_d4_diagnostics import json_default
+
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
@@ -457,7 +459,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -1092,6 +1094,16 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if os.environ.get("OPD_D4_DIAGNOSTICS") == "1":
+                        from verl.utils.opd_d4_diagnostics import build_response_mask_report
+
+                        mask_report = build_response_mask_report(
+                            attention_mask=batch.batch["attention_mask"],
+                            responses=batch.batch["responses"],
+                            response_mask=batch.batch["response_mask"],
+                            step=self.global_steps,
+                        )
+                        print(f"OPD_RESPONSE_MASK_CHECK {json.dumps(mask_report, sort_keys=True)}")
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1147,7 +1159,6 @@ class RayPPOTrainer:
                         if (self.global_steps == 1 or self.global_steps % 10 == 0) and "student_valid_counts" in batch.batch.keys():
                             try:
                                 import matplotlib.pyplot as plt
-                                import swanlab
 
                                 response_mask = batch.batch["response_mask"]
                                 valid_denom = response_mask.sum(dim=0) + 1e-6
@@ -1186,7 +1197,9 @@ class RayPPOTrainer:
                                 plt.grid(True)
                                 plt.tight_layout()
                                 
-                                count_plot = swanlab.Image(plt, caption=f"Candidate Counts (Step {self.global_steps})")
+                                count_plot = create_wandb_image(
+                                    plt, caption=f"Candidate Counts (Step {self.global_steps})"
+                                )
                                 plt.close()
                                 
                                 # Plot 2: Ratios
@@ -1207,7 +1220,9 @@ class RayPPOTrainer:
                                     plt.grid(True)
                                     plt.tight_layout()
                                     
-                                    ratio_student_plot = swanlab.Image(plt, caption=f"Overlap / Student Ratio (Step {self.global_steps})")
+                                    ratio_student_plot = create_wandb_image(
+                                        plt, caption=f"Overlap / Student Ratio (Step {self.global_steps})"
+                                    )
                                     plt.close()
                                     log_payload["viz/overlap_ratio_student"] = ratio_student_plot
 
@@ -1222,12 +1237,14 @@ class RayPPOTrainer:
                                     plt.grid(True)
                                     plt.tight_layout()
                                     
-                                    ratio_teacher_plot = swanlab.Image(plt, caption=f"Overlap / Teacher Ratio (Step {self.global_steps})")
+                                    ratio_teacher_plot = create_wandb_image(
+                                        plt, caption=f"Overlap / Teacher Ratio (Step {self.global_steps})"
+                                    )
                                     plt.close()
                                     log_payload["viz/overlap_ratio_teacher"] = ratio_teacher_plot
 
                                 logger.log(log_payload, step=self.global_steps)
-                                print(f"Logged candidate plots to SwanLab at step {self.global_steps}")
+                                print(f"Logged candidate plots to W&B at step {self.global_steps}")
                                 
                             except Exception as e:
                                 print(f"Error plotting candidate counts: {e}")
@@ -2052,7 +2069,6 @@ class RayPPOTrainer:
                     if self.config.trainer.get("is_plot", False) and (self.global_steps == 1 or self.global_steps % 10 == 0):
                         try:
                             import matplotlib.pyplot as plt
-                            import swanlab
                             
                             # Check if teacher_entropy is available
                             if "teacher_entropy" in batch.batch.keys():
@@ -2091,7 +2107,9 @@ class RayPPOTrainer:
                                 plt.xlabel("Position")
                                 plt.ylabel("Teacher Entropy")
                                 plt.tight_layout()
-                                entropy_plot = swanlab.Image(plt, caption=f"Teacher Entropy vs Position (Step {self.global_steps})")
+                                entropy_plot = create_wandb_image(
+                                    plt, caption=f"Teacher Entropy vs Position (Step {self.global_steps})"
+                                )
                                 plt.close()
                                 
                                 # 2. Plot Advantage Scatter
@@ -2101,7 +2119,9 @@ class RayPPOTrainer:
                                 plt.xlabel("Position")
                                 plt.ylabel("Advantage")
                                 plt.tight_layout()
-                                adv_plot = swanlab.Image(plt, caption=f"Advantage vs Position (Step {self.global_steps})")
+                                adv_plot = create_wandb_image(
+                                    plt, caption=f"Advantage vs Position (Step {self.global_steps})"
+                                )
                                 plt.close()
 
                                 # Compute Average per Position
@@ -2186,7 +2206,9 @@ class RayPPOTrainer:
                                 plt.ylabel("Avg Teacher Entropy")
                                 plt.grid(True)
                                 plt.tight_layout()
-                                avg_entropy_plot = swanlab.Image(plt, caption=f"Avg Teacher Entropy vs Position (Step {self.global_steps})")
+                                avg_entropy_plot = create_wandb_image(
+                                    plt, caption=f"Avg Teacher Entropy vs Position (Step {self.global_steps})"
+                                )
                                 plt.close()
 
                                 # 4. Plot Average Advantage Line
@@ -2203,18 +2225,19 @@ class RayPPOTrainer:
                                 plt.legend()
                                 plt.grid(True)
                                 plt.tight_layout()
-                                avg_adv_plot = swanlab.Image(plt, caption=f"Avg Advantage vs Position (Step {self.global_steps})")
+                                avg_adv_plot = create_wandb_image(
+                                    plt, caption=f"Avg Advantage vs Position (Step {self.global_steps})"
+                                )
                                 plt.close()
                                 
-                                # Log to SwanLab
-                                swanlab.log({
+                                logger.log({
                                     "viz/teacher_entropy_scatter": entropy_plot,
                                     "viz/advantage_scatter": adv_plot,
                                     "viz/avg_teacher_entropy_line": avg_entropy_plot,
                                     "viz/avg_advantage_line": avg_adv_plot
                                 }, step=self.global_steps)
-                                
-                                print(f"Logged 4 plots to SwanLab at step {self.global_steps}.")
+
+                                print(f"Logged 4 plots to W&B at step {self.global_steps}.")
                                 
                                 # Free memory
                                 del teacher_entropy_cpu, adv_cpu, mask_cpu, mask_float

@@ -8,8 +8,9 @@ ray stop --force
 ray start --head
 sleep 5
 
-export SWANLAB_LOG_DIR=${SWANLAB_LOG_DIR:-swanlog}
-export SWANLAB_MODE=${SWANLAB_MODE:-cloud}
+export WANDB_DIR=${WANDB_DIR:-wandb}
+export WANDB_MODE=${WANDB_MODE:-online}
+mkdir -p "$WANDB_DIR"
 
 # ---- user-adjustable ----
 STUDENT_MODEL=${STUDENT_MODEL:-DeepSeek-R1-Distill-Qwen-1.5B}
@@ -118,7 +119,7 @@ ROLLOUT=(
 
 TRAINER=(
     trainer.balance_batch=True
-    trainer.logger='["console","swanlab"]'
+    trainer.logger='["console","wandb"]'
     trainer.project_name=${project_name}
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}

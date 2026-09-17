@@ -1,0 +1,154 @@
+#!/bin/bash
+#PBS -N opd_d15_closeout
+#PBS -P personal
+#PBS -q q2
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+SOURCE_RUN_ID=${OPD_SAMPLED_RUN_ID:-21908511_pbs101}
+SOURCE_JOB_ID=${OPD_SAMPLED_SOURCE_JOB_ID:-21908511.pbs101}
+RUN_ROOT="$PROJECT_ROOT/logs/sampled_token/$SOURCE_RUN_ID"
+RUN_ID=${PBS_JOBID//./_}
+TEMP_ROOT=$(mktemp -d "/tmp/opd_d15_closeout_$RUN_ID.XXXXXX")
+CHECKPOINT_REPORT="$RUN_ROOT/reports/final_checkpoint_structure.json"
+ACCEPTANCE="$RUN_ROOT/reports/sampled_token_acceptance.json"
+READINESS="$RUN_ROOT/reports/sampled_token_readiness.md"
+QSTAT_REPORT="$RUN_ROOT/reports/training_qstat.txt"
+WANDB_REPORT="$RUN_ROOT/reports/wandb_api.json"
+PUBLISHED_CONFIG="$PROJECT_ROOT/configs/nscc/resolved_sampled_token_7168.yaml"
+PUBLISHED_REPORT="$PROJECT_ROOT/reports/sampled_token_readiness.md"
+MANIFEST="$RUN_ROOT/artifact_sha256.txt"
+
+for path in "$CHECKPOINT_REPORT" "$ACCEPTANCE" "$READINESS" "$QSTAT_REPORT" \
+    "$WANDB_REPORT" "$PUBLISHED_CONFIG" "$PUBLISHED_REPORT" "$MANIFEST"; do
+    if [[ -e "$path" ]]; then
+        echo "Refusing to overwrite sampled-token closeout artifact: $path" >&2
+        exit 2
+    fi
+done
+mkdir -p "$RUN_ROOT/reports"
+exec > >(tee "$RUN_ROOT/closeout_$RUN_ID.log") 2>&1
+
+on_exit() {
+    status=$?
+    rm -rf "$TEMP_ROOT"
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "SOURCE_RUN=$RUN_ROOT"
+echo "SOURCE_JOB=$SOURCE_JOB_ID"
+python -m pip check
+
+test -d "$RUN_ROOT/checkpoints/global_step_528"
+test "$(<"$RUN_ROOT/checkpoints/latest_checkpointed_iteration.txt")" = 528
+test -s "$RUN_ROOT/configs/resolved_sampled_token_7168.yaml"
+test -s "$RUN_ROOT/training_logs.txt"
+test -s "$RUN_ROOT/resource_csvs.txt"
+test -s "$RUN_ROOT/wandb_run_id.txt"
+
+qstat -x -f "$SOURCE_JOB_ID" > "$TEMP_ROOT/training_qstat.txt"
+grep -Eq 'job_state = F' "$TEMP_ROOT/training_qstat.txt"
+grep -Eq 'resources_used.walltime = 14:05:53' "$TEMP_ROOT/training_qstat.txt"
+
+python scripts/nscc/d4_checkpoint_verify.py \
+    --checkpoint "$RUN_ROOT/checkpoints/global_step_528" \
+    --output "$TEMP_ROOT/final_checkpoint_structure.json" >/dev/null
+
+mapfile -t training_logs < "$RUN_ROOT/training_logs.txt"
+mapfile -t resource_csvs < "$RUN_ROOT/resource_csvs.txt"
+if (( ${#training_logs[@]} != ${#resource_csvs[@]} )); then
+    echo "Sampled-token segment manifests are not paired" >&2
+    exit 2
+fi
+analyzer_args=()
+for index in "${!training_logs[@]}"; do
+    analyzer_args+=(
+        --training-log "${training_logs[$index]}"
+        --resource-csv "${resource_csvs[$index]}"
+    )
+done
+python scripts/nscc/d7_9_analyze_formal.py \
+    "${analyzer_args[@]}" \
+    --distillation-mode sampled_token \
+    --rollouts-root "$RUN_ROOT/rollouts" \
+    --wandb-run-id-file "$RUN_ROOT/wandb_run_id.txt" \
+    --run-root "$RUN_ROOT" \
+    --output "$TEMP_ROOT/sampled_token_acceptance.json" \
+    --readiness-output "$TEMP_ROOT/sampled_token_readiness.md"
+
+python - "$RUN_ROOT/wandb_run_id.txt" "$TEMP_ROOT/wandb_api.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+import wandb
+
+run_id = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+run = wandb.Api(timeout=60).run(
+    f"2523767186-queen-mary-university-of-london/OPD-NSCC/{run_id}"
+)
+step = run.summary.get("training/global_step")
+payload = {
+    "passed": run.state == "finished" and int(step) == 528,
+    "run_id": run_id,
+    "state": run.state,
+    "training_global_step": step,
+    "url": run.url,
+}
+if not payload["passed"]:
+    raise RuntimeError(f"W&B final state mismatch: {payload}")
+Path(sys.argv[2]).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+print("WANDB_SAMPLED_TOKEN_FINAL_OK")
+PY
+
+jq -e '.passed == true and .distillation_mode == "sampled_token" and .d7_9_status == "PASS_TRAINING_COMPLETE" and .full_data_one_epoch == true and (.steps | length) == 528' \
+    "$TEMP_ROOT/sampled_token_acceptance.json" >/dev/null
+jq -e '.passed == true' "$TEMP_ROOT/final_checkpoint_structure.json" >/dev/null
+jq -e '.passed == true' "$TEMP_ROOT/wandb_api.json" >/dev/null
+
+cp "$RUN_ROOT/configs/resolved_sampled_token_7168.yaml" "$TEMP_ROOT/resolved_sampled_token_7168.yaml"
+mv "$TEMP_ROOT/final_checkpoint_structure.json" "$CHECKPOINT_REPORT"
+mv "$TEMP_ROOT/sampled_token_acceptance.json" "$ACCEPTANCE"
+mv "$TEMP_ROOT/sampled_token_readiness.md" "$READINESS"
+mv "$TEMP_ROOT/training_qstat.txt" "$QSTAT_REPORT"
+mv "$TEMP_ROOT/wandb_api.json" "$WANDB_REPORT"
+mv "$TEMP_ROOT/resolved_sampled_token_7168.yaml" "$PUBLISHED_CONFIG"
+cp "$READINESS" "$PUBLISHED_REPORT"
+
+sha256sum \
+    "$RUN_ROOT/configs/resolved_sampled_token_7168.yaml" \
+    "$CHECKPOINT_REPORT" \
+    "$ACCEPTANCE" \
+    "$READINESS" \
+    "$QSTAT_REPORT" \
+    "$WANDB_REPORT" \
+    "$RUN_ROOT/training_logs.txt" \
+    "$RUN_ROOT/resource_csvs.txt" \
+    "$RUN_ROOT/wandb_run_id.txt" \
+    "${training_logs[@]}" \
+    "${resource_csvs[@]}" \
+    "$PUBLISHED_CONFIG" \
+    "$PUBLISHED_REPORT" \
+    > "$TEMP_ROOT/artifact_sha256.txt"
+sha256sum --check "$TEMP_ROOT/artifact_sha256.txt"
+mv "$TEMP_ROOT/artifact_sha256.txt" "$MANIFEST"
+
+echo D15_SAMPLED_TOKEN_CLOSEOUT_OK

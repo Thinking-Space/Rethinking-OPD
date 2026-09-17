@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Any
 
 
+def create_wandb_image(image, caption: str):
+    """Create a native W&B image without importing wandb at module load time."""
+    import wandb
+
+    return wandb.Image(image, caption=caption)
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 

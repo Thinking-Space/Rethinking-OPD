@@ -59,7 +59,8 @@ export NCCL_DEBUG=WARN
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=true
-export SWANLAB_LOG_DIR=${PROJECT_PATH}/swanlab/${PROJECT_NAME}/
+export WANDB_DIR=${PROJECT_PATH}/wandb/${PROJECT_NAME}/
+mkdir -p "$WANDB_DIR"
 export HYDRA_FULL_ERROR=1
 
 unset ROCR_VISIBLE_DEVICES
@@ -140,7 +141,7 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=reward_func \
     trainer.val_before_train=True \
     trainer.log_val_generations=2 \
-    trainer.logger=['console','swanlab'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=8 \

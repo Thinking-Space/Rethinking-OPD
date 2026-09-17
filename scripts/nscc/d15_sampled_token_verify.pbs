@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N opd_d15_verify
+#PBS -P personal
+#PBS -q q2
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+source /home/users/nus/xiongjie/scratch/opd-setup/activate_opd.sh
+module load git/2.39.2
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+
+python -m pytest -q \
+    tests/nscc/test_d2_single_gpu_inference.py \
+    tests/nscc/test_d4_pipeline.py \
+    tests/nscc/test_d4_acceptance.py \
+    verl/tests/utils/debug/test_metrics.py \
+    verl/tests/utils/test_opd_teacher_guard.py \
+    verl/tests/utils/test_opd_rollout_json.py \
+    verl/tests/utils/test_tracking_wandb.py
+python -m py_compile scripts/nscc/*.py verl/verl/utils/opd_*.py
+for script in \
+    scripts/nscc/*.pbs \
+    grpo.sh \
+    on_policy_distillation.sh \
+    verl/examples/ppo_trainer/on_policy_distillation.sh \
+    verl_example/opd.sh
+do
+    bash -n "$script"
+done
+git diff --check
+
+echo D15_SAMPLED_TOKEN_VERIFY_OK

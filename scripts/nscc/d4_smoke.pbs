@@ -1,0 +1,114 @@
+#!/bin/bash
+#PBS -N opd_d4_smoke
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=32:mem=220gb:ngpus=4
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+RUN_ID=${PBS_JOBID//./_}
+RUN_ROOT="$PROJECT_ROOT/logs/smoke/$RUN_ID"
+BASELINE_ROOT="$PROJECT_ROOT/eval/baseline/20395781_pbs101/artifacts"
+mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/configs" "$RUN_ROOT/reports"
+exec > >(tee "$RUN_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=offline
+export WANDB_DIR="$RUN_ROOT/wandb"
+export OPD_D4_DIAGNOSTICS=1
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=7200
+export RAY_TMPDIR="/tmp/opd_d4_$RUN_ID"
+export OMP_NUM_THREADS=4
+mkdir -p "$WANDB_DIR" "$RAY_TMPDIR"
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 4 ]]; then
+    echo "Expected exactly four PBS-assigned GPUs, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+test -s datasets/nscc_d4/train_seed2026.parquet
+test -s datasets/nscc_d4/dev_256_seed2026.parquet
+
+(
+    while true; do
+        date --iso-8601=seconds
+        nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader
+        sleep 60
+    done
+) > "$RUN_ROOT/gpu_monitor.log" 2>&1 &
+MONITOR_PID=$!
+
+run_phase() {
+    local phase=$1
+    mapfile -t overrides < <(
+        python scripts/nscc/d4_smoke_config.py --project-root "$PROJECT_ROOT" --run-root "$RUN_ROOT" --phase "$phase" --format lines
+    )
+    printf '%s\n' "${overrides[@]}" > "$RUN_ROOT/configs/${phase}_overrides.txt"
+    python -m verl.trainer.main_ppo "${overrides[@]}" --cfg job --resolve > "$RUN_ROOT/configs/resolved_smoke_${phase}.yaml"
+    python -m verl.trainer.main_ppo "${overrides[@]}" 2>&1 | tee "$RUN_ROOT/logs/${phase}.log"
+}
+
+run_phase primary
+python scripts/nscc/d4_checkpoint_verify.py --checkpoint "$RUN_ROOT/checkpoints/global_step_5" --output "$RUN_ROOT/reports/primary_checkpoint_structure.json" >/dev/null
+
+run_phase resume
+python scripts/nscc/d4_analyze_smoke.py --primary-log "$RUN_ROOT/logs/primary.log" --resume-log "$RUN_ROOT/logs/resume.log" --output "$RUN_ROOT/reports/log_acceptance.json"
+
+python verl/scripts/legacy_model_merger.py merge --backend fsdp --local_dir "$RUN_ROOT/checkpoints/global_step_8/actor" --target_dir "$RUN_ROOT/exported/global_step_8"
+
+FIRST_GPU=${CUDA_VISIBLE_DEVICES%%,*}
+CUDA_VISIBLE_DEVICES="$FIRST_GPU" python scripts/nscc/d4_export_inference.py --model "$RUN_ROOT/exported/global_step_8" --dev-file "$PROJECT_ROOT/datasets/nscc_d4/dev_256_seed2026.parquet" --output-dir "$RUN_ROOT/export_inference"
+
+python scripts/nscc/d4_checkpoint_verify.py --checkpoint "$RUN_ROOT/checkpoints/global_step_5" --checkpoint "$RUN_ROOT/checkpoints/global_step_8" --initial-model "$PROJECT_ROOT/model/DeepSeek-R1-Distill-Qwen-1.5B" --exported-model "$RUN_ROOT/exported/global_step_8" --output "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json"
+
+python scripts/nscc/d4_publish_readiness.py --data-manifest "$PROJECT_ROOT/repro/manifest.json" --baseline-summary "$BASELINE_ROOT/summary.json" --log-report "$RUN_ROOT/reports/log_acceptance.json" --checkpoint-report "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json" --export-acceptance "$RUN_ROOT/export_inference/acceptance.json" --smoke-root "$RUN_ROOT" --output "$RUN_ROOT/reports/readiness.md"
+
+for publish_path in "$PROJECT_ROOT/requirements.lock.txt" "$PROJECT_ROOT/configs/resolved_smoke.yaml" "$PROJECT_ROOT/reports/readiness.md"; do
+    if [[ -e "$publish_path" ]]; then
+        echo "Refusing to overwrite D4 published artifact: $publish_path" >&2
+        exit 2
+    fi
+done
+mkdir -p "$PROJECT_ROOT/configs" "$PROJECT_ROOT/reports"
+cp "$PROJECT_ROOT/repro/requirements.lock.txt" "$PROJECT_ROOT/requirements.lock.txt"
+cp "$RUN_ROOT/configs/resolved_smoke_primary.yaml" "$PROJECT_ROOT/configs/resolved_smoke.yaml"
+cp "$RUN_ROOT/reports/readiness.md" "$PROJECT_ROOT/reports/readiness.md"
+
+sha256sum "$RUN_ROOT/configs/resolved_smoke_primary.yaml" "$RUN_ROOT/configs/resolved_smoke_resume.yaml" "$RUN_ROOT/reports/log_acceptance.json" "$RUN_ROOT/reports/checkpoint_and_weight_acceptance.json" "$RUN_ROOT/export_inference/acceptance.json" "$RUN_ROOT/reports/readiness.md" "$PROJECT_ROOT/requirements.lock.txt" "$PROJECT_ROOT/configs/resolved_smoke.yaml" "$PROJECT_ROOT/reports/readiness.md" > "$RUN_ROOT/artifact_sha256.txt"
+sha256sum --check "$RUN_ROOT/artifact_sha256.txt"
+echo "D4_SMOKE_OK"

@@ -1,0 +1,156 @@
+#!/bin/bash
+#PBS -N opd_d6_validate7168
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=32:mem=220gb:ngpus=4
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+SHORT_PILOT_ROOT="$PROJECT_ROOT/logs/pilot/21027386_pbs101"
+SHORT_PILOT_ACTUAL_GPU_HOURS=2.3989
+RUN_ID=${PBS_JOBID//./_}
+RUN_ROOT="$PROJECT_ROOT/logs/pilot_7168/$RUN_ID"
+mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/configs" "$RUN_ROOT/reports"
+exec > >(tee "$RUN_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+    fi
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    trap - EXIT
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=offline
+export WANDB_DIR="$RUN_ROOT/wandb"
+export OPD_D4_DIAGNOSTICS=1
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=7200
+export RAY_TMPDIR="/tmp/opd_d6_$RUN_ID"
+export OMP_NUM_THREADS=4
+mkdir -p "$WANDB_DIR" "$RAY_TMPDIR"
+
+PBS_ASSIGNED_GPU_IDS=${CUDA_VISIBLE_DEVICES:-}
+if [[ -z "$PBS_ASSIGNED_GPU_IDS" ]] || [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 4 ]]; then
+    echo "Expected exactly four PBS-assigned GPUs, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+test -s datasets/nscc_d4/train_seed2026.parquet
+test -s datasets/nscc_d4/dev_256_seed2026.parquet
+test -d model/DeepSeek-R1-Distill-Qwen-1.5B
+test -d model/JustRL-DeepSeek-1.5B
+test -s "$SHORT_PILOT_ROOT/reports/pilot_4096_acceptance.json"
+
+monitor_resources() {
+    printf '%s\n' 'timestamp,gpu_index,memory_used_mib,memory_total_mib,utilization_percent,temperature_c,host_rss_kib'
+    while true; do
+        timestamp=$(date --iso-8601=seconds)
+        host_rss_kib=$(ps -u "$USER" -o rss= | awk '{sum += $1} END {printf "%.0f", sum + 0}')
+        while IFS=',' read -r gpu_index memory_used memory_total utilization temperature; do
+            gpu_index=${gpu_index//[[:space:]]/}
+            memory_used=${memory_used//[[:space:]]/}
+            memory_total=${memory_total//[[:space:]]/}
+            utilization=${utilization//[[:space:]]/}
+            temperature=${temperature//[[:space:]]/}
+            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+                "$timestamp" "$gpu_index" "$memory_used" "$memory_total" \
+                "$utilization" "$temperature" "$host_rss_kib"
+        done < <(
+            nvidia-smi \
+                --query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu \
+                --format=csv,noheader,nounits
+        )
+        sleep 30
+    done
+}
+monitor_resources > "$RUN_ROOT/resource_monitor.csv" 2>&1 &
+MONITOR_PID=$!
+
+mapfile -t overrides < <(
+    python scripts/nscc/d6_7168_config.py \
+        --project-root "$PROJECT_ROOT" \
+        --run-root "$RUN_ROOT" \
+        --format lines
+)
+printf '%s\n' "${overrides[@]}" > "$RUN_ROOT/configs/overrides.txt"
+python -m verl.trainer.main_ppo "${overrides[@]}" --cfg job --resolve \
+    > "$RUN_ROOT/configs/resolved_pilot_7168.yaml"
+python scripts/nscc/d6_7168_config.py \
+    --verify-resolved "$RUN_ROOT/configs/resolved_pilot_7168.yaml" \
+    > "$RUN_ROOT/reports/resolved_config.json"
+python -m verl.trainer.main_ppo "${overrides[@]}" 2>&1 \
+    | tee "$RUN_ROOT/logs/training.log"
+
+python scripts/nscc/d4_checkpoint_verify.py \
+    --checkpoint "$RUN_ROOT/checkpoints/global_step_8" \
+    --output "$RUN_ROOT/reports/checkpoint_structure.json" >/dev/null
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=
+
+python scripts/nscc/d6_analyze_7168.py \
+    --training-log "$RUN_ROOT/logs/training.log" \
+    --resource-csv "$RUN_ROOT/resource_monitor.csv" \
+    --rollouts-root "$RUN_ROOT/rollouts/primary" \
+    --short-report "$SHORT_PILOT_ROOT/reports/pilot_4096_acceptance.json" \
+    --short-pilot-actual-gpu-hours "$SHORT_PILOT_ACTUAL_GPU_HOURS" \
+    --run-root "$RUN_ROOT" \
+    --output "$RUN_ROOT/reports/g2_acceptance.json" \
+    --readiness-output "$RUN_ROOT/reports/g2_readiness.md"
+
+PUBLISHED_CONFIG="$PROJECT_ROOT/configs/nscc/resolved_pilot_7168.yaml"
+PUBLISHED_REPORT="$PROJECT_ROOT/reports/g2_readiness.md"
+for publish_path in "$PUBLISHED_CONFIG" "$PUBLISHED_REPORT"; do
+    if [[ -e "$publish_path" ]]; then
+        echo "Refusing to overwrite published D6 artifact: $publish_path" >&2
+        exit 2
+    fi
+done
+mkdir -p "$PROJECT_ROOT/configs/nscc" "$PROJECT_ROOT/reports"
+cp "$RUN_ROOT/configs/resolved_pilot_7168.yaml" "$PUBLISHED_CONFIG"
+cp "$RUN_ROOT/reports/g2_readiness.md" "$PUBLISHED_REPORT"
+
+sha256sum \
+    "$RUN_ROOT/configs/overrides.txt" \
+    "$RUN_ROOT/configs/resolved_pilot_7168.yaml" \
+    "$RUN_ROOT/reports/resolved_config.json" \
+    "$RUN_ROOT/reports/checkpoint_structure.json" \
+    "$RUN_ROOT/reports/g2_acceptance.json" \
+    "$RUN_ROOT/reports/g2_readiness.md" \
+    "$RUN_ROOT/resource_monitor.csv" \
+    "$PUBLISHED_CONFIG" \
+    "$PUBLISHED_REPORT" \
+    > "$RUN_ROOT/artifact_sha256.txt"
+sha256sum --check "$RUN_ROOT/artifact_sha256.txt"
+echo "G2_PASS"

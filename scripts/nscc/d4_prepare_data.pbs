@@ -1,0 +1,41 @@
+#!/bin/bash
+#PBS -N opd_d4_data
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+OUTPUT_DIR="$PROJECT_ROOT/datasets/nscc_d4"
+REPRO_DIR="$PROJECT_ROOT/repro"
+
+source "$OPD_SETUP/activate_opd.sh"
+module load git/2.39.2
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+which python
+python --version
+
+python scripts/nscc/d4_prepare_data.py
+mkdir -p "$REPRO_DIR"
+if [[ -e "$REPRO_DIR/manifest.json" || -e "$REPRO_DIR/requirements.lock.txt" ]]; then
+    echo "Refusing to overwrite existing D4 reproducibility artifacts" >&2
+    exit 2
+fi
+cp "$OUTPUT_DIR/data_manifest.json" "$REPRO_DIR/manifest.json"
+python -m pip freeze > "$REPRO_DIR/requirements.lock.txt"
+sha256sum "$OUTPUT_DIR/train_seed2026.parquet" "$OUTPUT_DIR/dev_256_seed2026.parquet" "$OUTPUT_DIR/data_manifest.json" "$REPRO_DIR/manifest.json" "$REPRO_DIR/requirements.lock.txt"
+echo "D4_DATA_PREP_OK"

@@ -1,0 +1,14 @@
+#!/bin/bash
+#PBS -N opd_sampled_token
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=32:mem=220gb:ngpus=4
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+export OPD_FORMAL_VARIANT=sampled_token
+exec bash "$PROJECT_ROOT/scripts/nscc/d7_9_formal_run.pbs"

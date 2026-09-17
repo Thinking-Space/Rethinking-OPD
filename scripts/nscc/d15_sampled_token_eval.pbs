@@ -1,0 +1,203 @@
+#!/bin/bash
+#PBS -N opd_d15_eval
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=8:mem=120gb:ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+SAMPLED_RUN_ROOT="$PROJECT_ROOT/logs/sampled_token/21908511_pbs101"
+CHECKPOINT="$SAMPLED_RUN_ROOT/checkpoints/global_step_528"
+SAMPLED_EXPORT="$SAMPLED_RUN_ROOT/exported/global_step_528"
+SAMPLED_ACCEPTANCE="$SAMPLED_RUN_ROOT/reports/sampled_token_acceptance.json"
+BASELINE_JOB_ROOT="$PROJECT_ROOT/eval/baseline/20395781_pbs101"
+BASELINE_ROOT="$BASELINE_JOB_ROOT/artifacts"
+TOP_K16_RUN_ROOT="$PROJECT_ROOT/logs/main/21110343_pbs101"
+TOP_K16_ACCEPTANCE="$TOP_K16_RUN_ROOT/reports/main_acceptance.json"
+TOP_K16_FINAL_REPORT="$PROJECT_ROOT/reports/NSCC_OPD_FINAL_REPORT.md"
+TOP_K16_EVAL_ROOT="$PROJECT_ROOT/eval/final/21857038_pbs101"
+TOP_K16_ARTIFACTS="$TOP_K16_EVAL_ROOT/artifacts"
+RUN_ID=${PBS_JOBID//./_}
+EVAL_ROOT="$PROJECT_ROOT/eval/sampled_token/$RUN_ID"
+MERGE_STAGE="$SAMPLED_RUN_ROOT/exported/.global_step_528_$RUN_ID"
+PROJECT_REPORT="$PROJECT_ROOT/reports/NSCC_OPD_SAMPLED_TOKEN_REPORT.md"
+PROJECT_RESULT="$PROJECT_ROOT/reports/NSCC_OPD_SAMPLED_TOKEN_EVALUATION.json"
+
+if [[ -e "$EVAL_ROOT" ]]; then
+    echo "Refusing to overwrite sampled-token evaluation root: $EVAL_ROOT" >&2
+    exit 2
+fi
+if [[ -e "$PROJECT_REPORT" || -e "$PROJECT_RESULT" ]]; then
+    echo "Refusing to overwrite published sampled-token report" >&2
+    exit 2
+fi
+mkdir -p "$EVAL_ROOT" "$PROJECT_ROOT/reports" "$SAMPLED_RUN_ROOT/exported"
+exec > >(tee "$EVAL_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+    fi
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    if [[ $status -ne 0 ]]; then
+        echo "FAILED_EVAL_ROOT=$EVAL_ROOT"
+        [[ ! -e "$MERGE_STAGE" ]] || echo "FAILED_MERGE_STAGE=$MERGE_STAGE"
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=disabled
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=4
+export RAY_TMPDIR="/tmp/opd_d15_eval_$RUN_ID"
+mkdir -p "$RAY_TMPDIR"
+
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 1 ]]; then
+    echo "Expected exactly one PBS-assigned GPU, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "SAMPLED_CHECKPOINT=$CHECKPOINT"
+echo "EVAL_ROOT=$EVAL_ROOT"
+module list 2>&1
+nvidia-smi
+python -m pip check
+
+test -s "$CHECKPOINT/data.pt"
+test -d "$CHECKPOINT/actor"
+test -s "$SAMPLED_ACCEPTANCE"
+test -s "$TOP_K16_ACCEPTANCE"
+test -s "$TOP_K16_FINAL_REPORT"
+test -s "$BASELINE_ROOT/summary.json"
+test -s "$TOP_K16_ARTIFACTS/summary.json"
+jq -e '.passed == true and .distillation_mode == "sampled_token" and .d7_9_status == "PASS_TRAINING_COMPLETE"' \
+    "$SAMPLED_ACCEPTANCE" >/dev/null
+jq -e '.passed == true and .d7_9_status == "PASS_TRAINING_COMPLETE"' \
+    "$TOP_K16_ACCEPTANCE" >/dev/null
+(
+    cd "$BASELINE_JOB_ROOT"
+    sha256sum --check artifact_sha256.txt
+)
+TOP_K16_IMMUTABLE_MANIFEST="$EVAL_ROOT/top_k16_immutable_manifest.txt"
+awk -v eval_root="$TOP_K16_EVAL_ROOT" -v export_root="$TOP_K16_RUN_ROOT/exported/global_step_528" \
+    '$2 ~ "^" eval_root "/" || $2 ~ "^" export_root "/" {print}' \
+    "$TOP_K16_EVAL_ROOT/artifact_sha256.txt" > "$TOP_K16_IMMUTABLE_MANIFEST"
+test "$(wc -l < "$TOP_K16_IMMUTABLE_MANIFEST")" -eq 11
+sha256sum --check "$TOP_K16_IMMUTABLE_MANIFEST"
+
+cp "$TOP_K16_FINAL_REPORT" \
+    "$EVAL_ROOT/top_k16_training_evidence.md"
+cp "$SAMPLED_RUN_ROOT/reports/training_qstat.txt" \
+    "$EVAL_ROOT/sampled_training_qstat.txt"
+TOP_K16_WALLTIME=$(sed -n 's/.*Job `21110343\.pbs101`.*`\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)`.*/\1/p' "$EVAL_ROOT/top_k16_training_evidence.md")
+SAMPLED_WALLTIME=$(awk -F' = ' '/resources_used.walltime =/{gsub(/[[:space:]]/, "", $2); print $2}' "$EVAL_ROOT/sampled_training_qstat.txt")
+test "$TOP_K16_WALLTIME" = 15:04:26
+test "$SAMPLED_WALLTIME" = 14:05:53
+
+python scripts/nscc/d12_final_eval.py \
+    --model "$SAMPLED_EXPORT" \
+    --gpu-id 0 \
+    --print-plan | tee "$EVAL_ROOT/frozen_plan.json"
+
+(
+    while true; do
+        date --iso-8601=seconds
+        nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu \
+            --format=csv,noheader
+        sleep 60
+    done
+) > "$EVAL_ROOT/gpu_monitor.log" 2>&1 &
+MONITOR_PID=$!
+
+if [[ -e "$SAMPLED_EXPORT" ]]; then
+    test -s "$SAMPLED_EXPORT/config.json"
+    find "$SAMPLED_EXPORT" -maxdepth 1 -type f -name '*.safetensors' -size +0c | grep -q .
+    echo "REUSING_SAMPLED_EXPORT=$SAMPLED_EXPORT"
+else
+    if [[ -e "$MERGE_STAGE" ]]; then
+        echo "Refusing to overwrite merge staging directory: $MERGE_STAGE" >&2
+        exit 2
+    fi
+    python verl/scripts/legacy_model_merger.py merge \
+        --backend fsdp \
+        --local_dir "$CHECKPOINT/actor" \
+        --target_dir "$MERGE_STAGE"
+    test -s "$MERGE_STAGE/config.json"
+    find "$MERGE_STAGE" -maxdepth 1 -type f -name '*.safetensors' -size +0c | grep -q .
+    mv "$MERGE_STAGE" "$SAMPLED_EXPORT"
+    echo "PUBLISHED_SAMPLED_EXPORT=$SAMPLED_EXPORT"
+fi
+
+python scripts/nscc/d12_final_eval.py \
+    --model "$SAMPLED_EXPORT" \
+    --gpu-id 0 \
+    --output-dir "$EVAL_ROOT/artifacts"
+
+mkdir -p "$EVAL_ROOT/reports"
+python scripts/nscc/d15_analyze_sampled.py \
+    --baseline-dir "$BASELINE_ROOT" \
+    --top-k16-dir "$TOP_K16_ARTIFACTS" \
+    --sampled-dir "$EVAL_ROOT/artifacts" \
+    --top-k16-training-acceptance "$TOP_K16_ACCEPTANCE" \
+    --sampled-training-acceptance "$SAMPLED_ACCEPTANCE" \
+    --top-k16-walltime "$TOP_K16_WALLTIME" \
+    --sampled-walltime "$SAMPLED_WALLTIME" \
+    --output-json "$EVAL_ROOT/reports/sampled_token_evaluation.json" \
+    --report-md "$EVAL_ROOT/reports/sampled_token_report.md" \
+    --failure-cases "$EVAL_ROOT/reports/failure_cases.json" \
+    --bootstrap-replicates 10000 \
+    --seed 2026
+
+jq -e '.passed == true and .evaluation_status == "TECHNICALLY_COMPLETE"' \
+    "$EVAL_ROOT/reports/sampled_token_evaluation.json" >/dev/null
+cp "$EVAL_ROOT/reports/sampled_token_report.md" "$PROJECT_REPORT"
+cp "$EVAL_ROOT/reports/sampled_token_evaluation.json" "$PROJECT_RESULT"
+
+sha256sum \
+    "$EVAL_ROOT/frozen_plan.json" \
+    "$TOP_K16_IMMUTABLE_MANIFEST" \
+    "$EVAL_ROOT/top_k16_training_evidence.md" \
+    "$EVAL_ROOT/sampled_training_qstat.txt" \
+    "$EVAL_ROOT/artifacts/final/dev_256.jsonl" \
+    "$EVAL_ROOT/artifacts/final/MATH-500.jsonl" \
+    "$EVAL_ROOT/artifacts/final/AIME24.jsonl" \
+    "$EVAL_ROOT/artifacts/summary.json" \
+    "$EVAL_ROOT/artifacts/acceptance.json" \
+    "$EVAL_ROOT/reports/sampled_token_evaluation.json" \
+    "$EVAL_ROOT/reports/sampled_token_report.md" \
+    "$EVAL_ROOT/reports/failure_cases.json" \
+    "$PROJECT_REPORT" \
+    "$PROJECT_RESULT" \
+    "$SAMPLED_EXPORT/config.json" \
+    "$SAMPLED_EXPORT/model.safetensors" \
+    > "$EVAL_ROOT/artifact_sha256.txt"
+sha256sum --check "$EVAL_ROOT/artifact_sha256.txt"
+
+echo "SAMPLED_VS_INITIAL=$(jq -r '.conclusion.sampled_vs_initial.verdict' "$PROJECT_RESULT")"
+echo "SAMPLED_VS_TOP_K16=$(jq -r '.conclusion.sampled_vs_top_k16' "$PROJECT_RESULT")"
+echo D15_SAMPLED_TOKEN_EVALUATION_COMPLETE

@@ -42,9 +42,9 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 # export ADV_ESTIMATOR=token_grpo
 export ADV_ESTIMATOR=grpo
 export GRPO_OUTCOME_WEIGHT=1.0
-# Swanlab setting used to continue exp  
-# export SWANLAB_RESUME=must
-# export SWANLAB_RUN_ID="jri5qia6iy67v7su0zjsv"
+# Weights & Biases settings used to continue an experiment
+# export WANDB_RESUME=must
+# export WANDB_RUN_ID="jri5qia6iy67v7su0zjsv"
 
 
 export MAX_PROMPT_LENGTH=1024
@@ -115,7 +115,8 @@ export NCCL_DEBUG=WARN
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=true
-export SWANLAB_LOG_DIR=${PROJECT_PATH}/swanlab_log
+export WANDB_DIR=${PROJECT_PATH}/wandb_log
+mkdir -p "$WANDB_DIR"
 export HYDRA_FULL_ERROR=1
 
 
@@ -211,7 +212,7 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=reward_func \
     trainer.val_before_train=False \
     trainer.log_val_generations=2 \
-    trainer.logger=['console','swanlab'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.validation_data_dir=validation_log/$EXPERIMENT_NAME \

@@ -1,0 +1,16 @@
+# Python/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Experiment tracking and scheduler output
+/wandb/
+/wandb_log/
+/opd_*.o*
+
+# Large or generated NSCC artifacts
+/datasets/nscc_d4/
+/eval/
+/logs/
+/model/
+/reports/

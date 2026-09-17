@@ -1,0 +1,286 @@
+#!/bin/bash
+#PBS -N opd_d7_9_formal
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=32:mem=220gb:ngpus=4
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+PHASE=${OPD_MAIN_PHASE:-primary}
+RUN_ID=${PBS_JOBID//./_}
+RESUME_STEP=${OPD_MAIN_RESUME_STEP:-}
+VARIANT=${OPD_FORMAL_VARIANT:-top_k}
+
+if [[ "$VARIANT" == top_k ]]; then
+    RUN_SCOPE=main
+    CONFIG_SCRIPT=scripts/nscc/d7_9_formal_config.py
+    CONFIG_FILENAME=resolved_main_7168.yaml
+    ACCEPTANCE_FILENAME=main_acceptance.json
+    READINESS_FILENAME=main_readiness.md
+    PUBLISHED_CONFIG="$PROJECT_ROOT/configs/nscc/resolved_main_7168.yaml"
+    PUBLISHED_REPORT="$PROJECT_ROOT/reports/main_readiness.md"
+    WANDB_NAME_VALUE=d7_9_formal_opd_seed2026
+    WANDB_RUN_ID_PREFIX=opd-d7-9-seed2026
+    ANALYZER_EXTRA_ARGS=()
+    SUCCESS_MARKER=D7_9_FORMAL_TRAINING_OK
+elif [[ "$VARIANT" == sampled_token ]]; then
+    RUN_SCOPE=sampled_token
+    CONFIG_SCRIPT=scripts/nscc/d15_sampled_token_config.py
+    CONFIG_FILENAME=resolved_sampled_token_7168.yaml
+    ACCEPTANCE_FILENAME=sampled_token_acceptance.json
+    READINESS_FILENAME=sampled_token_readiness.md
+    PUBLISHED_CONFIG="$PROJECT_ROOT/configs/nscc/resolved_sampled_token_7168.yaml"
+    PUBLISHED_REPORT="$PROJECT_ROOT/reports/sampled_token_readiness.md"
+    WANDB_NAME_VALUE=sampled_token_control_opd_seed2026
+    WANDB_RUN_ID_PREFIX=opd-sampled-token-seed2026
+    ANALYZER_EXTRA_ARGS=(--distillation-mode sampled_token)
+    SUCCESS_MARKER=SAMPLED_TOKEN_CONTROL_TRAINING_OK
+else
+    echo "OPD_FORMAL_VARIANT must be top_k or sampled_token" >&2
+    exit 2
+fi
+
+if [[ "$PHASE" == primary ]]; then
+    if [[ -n "${OPD_MAIN_RUN_ROOT:-}" || -n "$RESUME_STEP" ]]; then
+        echo "Primary phase does not accept OPD_MAIN_RUN_ROOT or OPD_MAIN_RESUME_STEP" >&2
+        exit 2
+    fi
+    RUN_ROOT="$PROJECT_ROOT/logs/$RUN_SCOPE/$RUN_ID"
+    SEGMENT_NAME=primary
+elif [[ "$PHASE" == resume ]]; then
+    if [[ -z "${OPD_MAIN_RUN_ROOT:-}" || ! "$RESUME_STEP" =~ ^[0-9]+$ ]]; then
+        echo "Resume requires OPD_MAIN_RUN_ROOT and integer OPD_MAIN_RESUME_STEP" >&2
+        exit 2
+    fi
+    RUN_ROOT=$(realpath -m "$OPD_MAIN_RUN_ROOT")
+    case "$RUN_ROOT/" in
+        "$PROJECT_ROOT/logs/$RUN_SCOPE/"*) ;;
+        *) echo "Resume run root must stay under $PROJECT_ROOT/logs/$RUN_SCOPE" >&2; exit 2 ;;
+    esac
+    if (( RESUME_STEP < 1 || RESUME_STEP >= 528 )); then
+        echo "Resume step must be between 1 and 527" >&2
+        exit 2
+    fi
+    SEGMENT_NAME="resume_${RESUME_STEP}"
+else
+    echo "OPD_MAIN_PHASE must be primary or resume" >&2
+    exit 2
+fi
+
+SEGMENT_ID="${SEGMENT_NAME}_${RUN_ID}"
+SEGMENT_ROOT="$RUN_ROOT/segments/$SEGMENT_ID"
+mkdir -p "$RUN_ROOT/configs" "$RUN_ROOT/reports" "$RUN_ROOT/rollouts" \
+    "$RUN_ROOT/validation" "$RUN_ROOT/hydra" "$SEGMENT_ROOT"
+if ! mkdir "$RUN_ROOT/.active_segment_lock" 2>/dev/null; then
+    echo "Another formal segment is active, or a stale lock needs inspection: $RUN_ROOT" >&2
+    exit 2
+fi
+exec > >(tee "$SEGMENT_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+    fi
+    rmdir "$RUN_ROOT/.active_segment_lock" 2>/dev/null || true
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    trap - EXIT
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=online
+export WANDB_DIR="$RUN_ROOT/wandb"
+export WANDB_NAME="$WANDB_NAME_VALUE"
+if [[ "$PHASE" == primary ]]; then
+    export WANDB_RUN_ID="${WANDB_RUN_ID_PREFIX}-${PBS_JOBID%%.*}"
+    export WANDB_RESUME=never
+    printf '%s\n' "$WANDB_RUN_ID" > "$RUN_ROOT/wandb_run_id.txt"
+else
+    test -s "$RUN_ROOT/wandb_run_id.txt"
+    export WANDB_RUN_ID
+    WANDB_RUN_ID=$(<"$RUN_ROOT/wandb_run_id.txt")
+    export WANDB_RESUME=must
+fi
+export OPD_D4_DIAGNOSTICS=1
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=7200
+export RAY_TMPDIR="/tmp/opd_d7_9_$RUN_ID"
+export OMP_NUM_THREADS=4
+mkdir -p "$WANDB_DIR" "$RAY_TMPDIR"
+
+PBS_ASSIGNED_GPU_IDS=${CUDA_VISIBLE_DEVICES:-}
+if [[ -z "$PBS_ASSIGNED_GPU_IDS" ]] || [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 4 ]]; then
+    echo "Expected exactly four PBS-assigned GPUs, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PHASE=$PHASE"
+echo "VARIANT=$VARIANT"
+echo "RUN_ROOT=$RUN_ROOT"
+echo "RESUME_STEP=${RESUME_STEP:-none}"
+echo "WANDB_RUN_ID=$WANDB_RUN_ID"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+test -s datasets/nscc_d4/train_seed2026.parquet
+test -s datasets/nscc_d4/dev_256_seed2026.parquet
+test -d model/DeepSeek-R1-Distill-Qwen-1.5B
+test -d model/JustRL-DeepSeek-1.5B
+test -s reports/g2_readiness.md
+python - <<'PY'
+import wandb
+
+viewer = wandb.Api(timeout=60).viewer
+if not viewer:
+    raise RuntimeError("W&B authenticated viewer is unavailable")
+print("WANDB_ONLINE_PREFLIGHT_OK")
+PY
+
+if [[ "$PHASE" == resume ]]; then
+    RESUME_CHECKPOINT="$RUN_ROOT/checkpoints/global_step_$RESUME_STEP"
+    test -d "$RESUME_CHECKPOINT"
+    python scripts/nscc/d4_checkpoint_verify.py \
+        --checkpoint "$RESUME_CHECKPOINT" \
+        --output "$SEGMENT_ROOT/resume_checkpoint_structure.json" >/dev/null
+fi
+
+printf '%s\n' "$SEGMENT_ROOT/training.log" >> "$RUN_ROOT/training_logs.txt"
+printf '%s\n' "$SEGMENT_ROOT/resource_monitor.csv" >> "$RUN_ROOT/resource_csvs.txt"
+segment_count=$(wc -l < "$RUN_ROOT/training_logs.txt")
+if (( segment_count > 3 )); then
+    echo "Formal budget permits at most three 24-hour four-GPU segments" >&2
+    exit 2
+fi
+
+monitor_resources() {
+    printf '%s\n' 'timestamp,gpu_index,memory_used_mib,memory_total_mib,utilization_percent,temperature_c,host_rss_kib'
+    while true; do
+        timestamp=$(date --iso-8601=seconds)
+        host_rss_kib=$(ps -u "$USER" -o rss= | awk '{sum += $1} END {printf "%.0f", sum + 0}')
+        while IFS=',' read -r gpu_index memory_used memory_total utilization temperature; do
+            gpu_index=${gpu_index//[[:space:]]/}
+            memory_used=${memory_used//[[:space:]]/}
+            memory_total=${memory_total//[[:space:]]/}
+            utilization=${utilization//[[:space:]]/}
+            temperature=${temperature//[[:space:]]/}
+            printf '%s,%s,%s,%s,%s,%s,%s\n' \
+                "$timestamp" "$gpu_index" "$memory_used" "$memory_total" \
+                "$utilization" "$temperature" "$host_rss_kib"
+        done < <(
+            nvidia-smi \
+                --query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu \
+                --format=csv,noheader,nounits
+        )
+        sleep 30
+    done
+}
+monitor_resources > "$SEGMENT_ROOT/resource_monitor.csv" 2>&1 &
+MONITOR_PID=$!
+
+config_args=(
+    --project-root "$PROJECT_ROOT"
+    --run-root "$RUN_ROOT"
+    --phase "$PHASE"
+)
+if [[ "$PHASE" == resume ]]; then
+    config_args+=(--resume-step "$RESUME_STEP")
+fi
+mapfile -t overrides < <(
+    python "$CONFIG_SCRIPT" "${config_args[@]}" --format lines
+)
+printf '%s\n' "${overrides[@]}" > "$SEGMENT_ROOT/overrides.txt"
+if [[ "$PHASE" == primary ]]; then
+    RESOLVED_CONFIG="$RUN_ROOT/configs/$CONFIG_FILENAME"
+else
+    RESOLVED_CONFIG="$SEGMENT_ROOT/resolved_${SEGMENT_NAME}.yaml"
+fi
+python -m verl.trainer.main_ppo "${overrides[@]}" --cfg job --resolve \
+    > "$RESOLVED_CONFIG"
+python "$CONFIG_SCRIPT" \
+    "${config_args[@]}" \
+    --verify-resolved "$RESOLVED_CONFIG" \
+    > "$SEGMENT_ROOT/resolved_config_check.json"
+
+python -m verl.trainer.main_ppo "${overrides[@]}" 2>&1 \
+    | tee "$SEGMENT_ROOT/training.log"
+
+test -d "$RUN_ROOT/checkpoints/global_step_528"
+python scripts/nscc/d4_checkpoint_verify.py \
+    --checkpoint "$RUN_ROOT/checkpoints/global_step_528" \
+    --output "$RUN_ROOT/reports/final_checkpoint_structure.json" >/dev/null
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=
+
+mapfile -t training_logs < "$RUN_ROOT/training_logs.txt"
+mapfile -t resource_csvs < "$RUN_ROOT/resource_csvs.txt"
+if (( ${#training_logs[@]} != ${#resource_csvs[@]} )); then
+    echo "Formal segment manifests are not paired" >&2
+    exit 2
+fi
+analyzer_args=()
+for index in "${!training_logs[@]}"; do
+    analyzer_args+=(
+        --training-log "${training_logs[$index]}"
+        --resource-csv "${resource_csvs[$index]}"
+    )
+done
+python scripts/nscc/d7_9_analyze_formal.py \
+    "${analyzer_args[@]}" \
+    "${ANALYZER_EXTRA_ARGS[@]}" \
+    --rollouts-root "$RUN_ROOT/rollouts" \
+    --wandb-run-id-file "$RUN_ROOT/wandb_run_id.txt" \
+    --run-root "$RUN_ROOT" \
+    --output "$RUN_ROOT/reports/$ACCEPTANCE_FILENAME" \
+    --readiness-output "$RUN_ROOT/reports/$READINESS_FILENAME"
+
+for publish_path in "$PUBLISHED_CONFIG" "$PUBLISHED_REPORT"; do
+    if [[ -e "$publish_path" ]]; then
+        echo "Refusing to overwrite published D7-9 artifact: $publish_path" >&2
+        exit 2
+    fi
+done
+mkdir -p "$PROJECT_ROOT/configs/nscc" "$PROJECT_ROOT/reports"
+cp "$RUN_ROOT/configs/$CONFIG_FILENAME" "$PUBLISHED_CONFIG"
+cp "$RUN_ROOT/reports/$READINESS_FILENAME" "$PUBLISHED_REPORT"
+
+sha256sum \
+    "$RUN_ROOT/configs/$CONFIG_FILENAME" \
+    "$RUN_ROOT/reports/final_checkpoint_structure.json" \
+    "$RUN_ROOT/reports/$ACCEPTANCE_FILENAME" \
+    "$RUN_ROOT/reports/$READINESS_FILENAME" \
+    "$RUN_ROOT/training_logs.txt" \
+    "$RUN_ROOT/resource_csvs.txt" \
+    "$RUN_ROOT/wandb_run_id.txt" \
+    "${training_logs[@]}" \
+    "${resource_csvs[@]}" \
+    "$PUBLISHED_CONFIG" \
+    "$PUBLISHED_REPORT" \
+    > "$RUN_ROOT/artifact_sha256.txt"
+sha256sum --check "$RUN_ROOT/artifact_sha256.txt"
+echo "$SUCCESS_MARKER"

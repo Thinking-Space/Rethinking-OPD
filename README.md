@@ -21,6 +21,54 @@
 
 ---
 
+## NSCC ASPIRE 2A Reproduction
+
+This branch contains a completed, staged reproduction of OPD on one NSCC ASPIRE 2A node with 4 × NVIDIA A100 40GB GPUs. It keeps the upstream OPD/verl training path and adds PBS orchestration, reproducibility manifests, safety diagnostics, independent evaluation, W&B tracking, and a sampled-token control.
+
+- Student: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+- Teacher: hbx/JustRL-DeepSeek-1.5B
+- Upstream baseline: commit ac26e38d6f1572eb027597b48a9f4e01f6915ef8
+- Main run: token_reward_direct, top-k=16, only_stu, student_p weighting, 528 steps
+- Control: identical configuration with top-k=0 (sampled-token OPD)
+- Full report: [docs/NSCC_OPD_PROJECT_REPORT.md](docs/NSCC_OPD_PROJECT_REPORT.md)
+- Execution timeline: [NSCC_OPD_Reproduction_Timeline.md](NSCC_OPD_Reproduction_Timeline.md)
+
+### Reproduction result
+
+All comparisons below use the same frozen prompts, hashes, generation protocol, and problem-level paired bootstrap with 10,000 replicates.
+
+| Model | MATH-500 pass@1 | AIME24 pass@1 |
+|---|---:|---:|
+| Initial Student | 0.7455 | 0.1833 |
+| Teacher | 0.8250 | 0.3146 |
+| OPD top-k16 | 0.8160 | 0.3271 |
+| OPD sampled-token | 0.8160 | 0.3125 |
+
+Top-k16 versus the initial Student improved by +0.0705 on MATH-500 (95% CI [0.0465, 0.0945]) and +0.1438 on AIME24 ([0.0729, 0.2208]). Sampled-token improved by +0.0705 ([0.0490, 0.0920]) and +0.1292 ([0.0688, 0.1979]). The two OPD variants were not reliably different from each other in this single-seed experiment.
+
+The complete top-k16 run used 60.30 GPU-hours; sampled-token used 56.39 GPU-hours. AIME24 remained length-sensitive: final truncation rates were 0.623 and 0.627 at a 7168-token response cap, so absolute AIME scores should be interpreted with that limitation.
+
+### NSCC entry points
+
+GPU work must be submitted through PBS; do not run training on a login node.
+
+~~~bash
+cd /home/users/nus/xiongjie/scratch/OPD
+
+# Main top-k16 run
+qsub scripts/nscc/d7_9_formal_run.pbs
+
+# Sampled-token control
+qsub scripts/nscc/d15_sampled_token_run.pbs
+
+# CPU regression and syntax checks
+qsub scripts/nscc/d15_sampled_token_verify.pbs
+~~~
+
+Resolved configurations are stored under configs/nscc/, while commit/model/data hashes and dataset statistics are stored in repro/manifest.json. W&B runs are available for [top-k16](https://wandb.ai/2523767186-queen-mary-university-of-london/OPD-NSCC/runs/opd-d7-9-seed2026-21110343) and [sampled-token](https://wandb.ai/2523767186-queen-mary-university-of-london/OPD-NSCC/runs/opd-sampled-token-seed2026-21908511).
+
+Generated checkpoints, model weights, datasets, logs, per-example evaluation outputs, and machine-generated result reports are intentionally excluded from Git. They remain in the corresponding model/, datasets/nscc_d4/, logs/, eval/, and reports/ directories on the execution host.
+
 ## 🎉News
 
 - **[2026-05-27]** Our [paper](https://arxiv.org/pdf/2604.13016) has been accepted to ICML 2026 FoGen Workshop, see you in Seoul!

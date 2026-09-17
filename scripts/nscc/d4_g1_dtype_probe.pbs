@@ -1,0 +1,128 @@
+#!/bin/bash
+#PBS -N opd_g1_dtype_probe
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=32:mem=220gb:ngpus=4
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+RUN_ID=${PBS_JOBID//./_}
+RUN_ROOT="$PROJECT_ROOT/logs/g1_probe/$RUN_ID"
+mkdir -p "$RUN_ROOT"
+exec > >(tee "$RUN_ROOT/job.log") 2>&1
+
+MONITOR_PID=
+on_exit() {
+    status=$?
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+    ray stop --force >/dev/null 2>&1 || true
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=disabled
+export OPD_D4_DIAGNOSTICS=1
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=7200
+export OMP_NUM_THREADS=4
+
+PBS_ASSIGNED_GPU_IDS=$CUDA_VISIBLE_DEVICES
+if [[ $(awk -F, '{print NF}' <<< "$PBS_ASSIGNED_GPU_IDS") -ne 4 ]]; then
+    echo "Expected exactly four PBS-assigned GPUs, got: $PBS_ASSIGNED_GPU_IDS" >&2
+    exit 2
+fi
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "PBS_ASSIGNED_GPU_IDS=$PBS_ASSIGNED_GPU_IDS"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+module list 2>&1
+nvidia-smi
+python -m pip check
+
+(
+    while true; do
+        date --iso-8601=seconds
+        nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader
+        sleep 60
+    done
+) > "$RUN_ROOT/gpu_monitor.log" 2>&1 &
+MONITOR_PID=$!
+
+run_variant() {
+    local variant=$1
+    local actor_dtype=$2
+    local variant_root="$RUN_ROOT/$variant"
+    mkdir -p "$variant_root/configs" "$variant_root/logs"
+    export RAY_TMPDIR="/tmp/g1-${PBS_JOBID%%.*}"
+    mkdir -p "$RAY_TMPDIR"
+    ray stop --force >/dev/null 2>&1 || true
+
+    mapfile -t overrides < <(
+        python scripts/nscc/d4_smoke_config.py \
+            --project-root "$PROJECT_ROOT" \
+            --run-root "$variant_root" \
+            --phase primary \
+            --format lines
+    )
+
+    for index in "${!overrides[@]}"; do
+        case "${overrides[$index]}" in
+            actor_rollout_ref.actor.fsdp_config.model_dtype=*)
+                overrides[$index]="actor_rollout_ref.actor.fsdp_config.model_dtype=$actor_dtype"
+                ;;
+            trainer.total_training_steps=*)
+                overrides[$index]="trainer.total_training_steps=1"
+                ;;
+            trainer.save_freq=*)
+                overrides[$index]="trainer.save_freq=-1"
+                ;;
+            trainer.logger=*)
+                overrides[$index]="trainer.logger=[console]"
+                ;;
+            trainer.experiment_name=*)
+                overrides[$index]="trainer.experiment_name=g1_dtype_probe_${variant}"
+                ;;
+        esac
+    done
+
+    printf '%s\n' "${overrides[@]}" > "$variant_root/configs/overrides.txt"
+    python -m verl.trainer.main_ppo "${overrides[@]}" --cfg job --resolve \
+        > "$variant_root/configs/resolved.yaml"
+    python -m verl.trainer.main_ppo "${overrides[@]}" 2>&1 \
+        | tee "$variant_root/logs/train.log"
+    grep -m 1 'training/rollout_log_probs_diff_max' "$variant_root/logs/train.log" \
+        > "$variant_root/logprob_metric_line.txt"
+}
+
+run_variant fp32_control fp32
+run_variant bf16_actor bfloat16
+
+{
+    echo "FP32_CONTROL"
+    cat "$RUN_ROOT/fp32_control/logprob_metric_line.txt"
+    echo "BF16_ACTOR"
+    cat "$RUN_ROOT/bf16_actor/logprob_metric_line.txt"
+} > "$RUN_ROOT/comparison.txt"
+cat "$RUN_ROOT/comparison.txt"
+echo "G1_DTYPE_PROBE_OK"

@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N opd_d2_infer
+#PBS -P personal
+#PBS -q normal
+#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o /home/users/nus/xiongjie/scratch/opd-setup/logs/
+
+set -euo pipefail
+
+PROJECT_ROOT=/home/users/nus/xiongjie/scratch/OPD
+OPD_SETUP=/home/users/nus/xiongjie/scratch/opd-setup
+RUN_ID=${PBS_JOBID//./_}
+OUTPUT_DIR="$PROJECT_ROOT/eval/d2_single_gpu/$RUN_ID"
+
+if [[ -e "$OUTPUT_DIR" ]]; then
+    echo "Refusing to overwrite existing output directory: $OUTPUT_DIR" >&2
+    exit 2
+fi
+mkdir -p "$OUTPUT_DIR"
+exec > >(tee "$OUTPUT_DIR/job.log") 2>&1
+
+on_exit() {
+    status=$?
+    echo "EXIT_STATUS=$status"
+    echo "FINISHED_AT=$(date --iso-8601=seconds)"
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true
+    exit "$status"
+}
+trap on_exit EXIT
+
+source "$OPD_SETUP/activate_opd.sh"
+cd "$PROJECT_ROOT"
+
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/verl${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/users/nus/xiongjie/scratch/opd-cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export WANDB_MODE=disabled
+export OMP_NUM_THREADS=4
+
+BATCH_SIZE=${BATCH_SIZE:-4}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
+ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
+
+echo "JOB_ID=$PBS_JOBID"
+echo "NODE=$(hostname)"
+echo "STARTED_AT=$(date --iso-8601=seconds)"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "MAX_NEW_TOKENS=$MAX_NEW_TOKENS"
+echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
+module list 2>&1
+nvidia-smi
+which python
+python --version
+python -m pip check
+python -c "import verl, vllm; print('VERL_PATH=' + verl.__file__); print('VLLM_VERSION=' + vllm.__version__)"
+
+python scripts/nscc/d2_single_gpu_inference.py \
+    --project-root "$PROJECT_ROOT" \
+    --output-dir "$OUTPUT_DIR/artifacts" \
+    --batch-size "$BATCH_SIZE" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    --attn-implementation "$ATTN_IMPLEMENTATION"
+
+sha256sum \
+    "$OUTPUT_DIR/artifacts/student_results.jsonl" \
+    "$OUTPUT_DIR/artifacts/teacher_results.jsonl" \
+    "$OUTPUT_DIR/artifacts/tokenizer_compatibility.json" \
+    "$OUTPUT_DIR/artifacts/summary.json" \
+    "$OUTPUT_DIR/artifacts/acceptance.json" \
+    > "$OUTPUT_DIR/artifact_sha256.txt"
+
+sha256sum --check "$OUTPUT_DIR/artifact_sha256.txt"
+echo "D2_SINGLE_GPU_JOB_OK"

@@ -729,6 +729,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
+        if os.environ.get("OPD_D4_DIAGNOSTICS") == "1":
+            self._opd_rollout_sync_count = getattr(self, "_opd_rollout_sync_count", 0) + 1
+            if self.rank == 0:
+                report = {
+                    "passed": True,
+                    "rank": self.rank,
+                    "sync_count": self._opd_rollout_sync_count,
+                }
+                print(f"OPD_ROLLOUT_WEIGHT_SYNC {json.dumps(report, sort_keys=True)}")
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
@@ -1921,6 +1930,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
+        self.reward_module.eval()
+        if os.environ.get("OPD_D4_DIAGNOSTICS") == "1":
+            from verl.utils.opd_teacher_guard import freeze_teacher
+
+            self._opd_teacher_guard = freeze_teacher(self.reward_module)
+            guard_report = self._opd_teacher_guard.assert_unchanged(step="init")
+            if self.rank == 0:
+                print(f"OPD_TEACHER_FROZEN_INIT {json.dumps(guard_report, sort_keys=True)}")
 
     def _forward_micro_batch(self, micro_batch, student_top_k_ids=None, compute_entropy=False, top_k=0, strategy="only_stu", teacher_temperature=1.0):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
@@ -2752,6 +2769,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # unshard the root FSDP module
         if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
             self.reward_module._handle.reshard(True)
+
+        if hasattr(self, "_opd_teacher_guard"):
+            guard_report = self._opd_teacher_guard.assert_unchanged(step=global_steps)
+            if self.rank == 0:
+                print(f"OPD_TEACHER_FROZEN_CHECK {json.dumps(guard_report, sort_keys=True)}")
 
         # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k data
         # output = output.to("cpu")
