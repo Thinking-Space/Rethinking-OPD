@@ -23,7 +23,7 @@
 
 ## 🎉News
 
-- **[2026-11-18]** [Rethinking OPD](https://arxiv.org/pdf/2604.13016) has been awarded a J2C Certification!
+- **[2026-11-18]** [Rethinking OPD](https://arxiv.org/pdf/2604.13016) has been awarded a Journal-to-Conference (J2C) Certification from TMLR!
 - **[2026-10-14]** [Rethinking OPD](https://arxiv.org/pdf/2604.13016) has been accepted to TMLR!
 - **[2026-05-27]** [Rethinking OPD](https://arxiv.org/pdf/2604.13016) has been accepted to ICML 2026 FoGen Workshop, see you in Seoul!
 - **[2026-05-26]** Our top-k OPD overlap diagnostics have been merged into [verl](https://github.com/verl-project/verl/pull/6469), adding `distillation/overlap_ratio` and `distillation/overlap_token_advantage` metrics following our token-level analysis.
